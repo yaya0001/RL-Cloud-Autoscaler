@@ -1,14 +1,4 @@
-"""
-Traffic-stress test using the Adapter Design Pattern.
-
-Evaluates the final trained agents under three traffic conditions:
-
-1. Deterministic traffic
-2. Poisson-only traffic
-3. Bursty spike traffic
-
-The trained policies stay fixed. Only the workload pattern changes.
-"""
+"""Traffic stress test for final trained autoscaling agents."""
 
 import argparse
 import csv
@@ -18,10 +8,11 @@ from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
 import numpy as np
-from stable_baselines3 import A2C, PPO
+from stable_baselines3 import A2C, DQN, PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-from agent_adapters import SB3AgentAdapter, RecurrentPPOAdapter
+from agent_adapters import BaselineAdapter, RecurrentPPOAdapter, SB3AgentAdapter
+from baseline_agent import RuleBasedBaseline
 from env_factory import make_env
 
 try:
@@ -29,62 +20,57 @@ try:
 except ImportError:
     RecurrentPPO = None
 
+try:
+    from custom_dqn_policies import DuelingDQNPolicy, DoubleDuelingDQNPolicy
+except ImportError:
+    from dueling_dqn import DuelingDQNPolicy
+    from double_dueling_dqn import DoubleDuelingDQNPolicy
+
 
 @dataclass
 class ModelSpec:
     name: str
-    model_class: object
-    model_path: str
-    vecnorm_path: str
+    model_type: str
+    model_path: str = None
+    vecnorm_path: str = None
+    model_class: object = None
+    custom_policy: object = None
+
+
+@dataclass
+class TrafficSpec:
+    name: str
+    env_kwargs: dict
 
 
 MODEL_SPECS = [
-    ModelSpec(
-        "PPO",
-        PPO,
-        "./models/best_ppo/best_model.zip",
-        "./models/vecnormalize_ppo.pkl",
-    ),
-    ModelSpec(
-        "A2C Final",
-        A2C,
-        "./models/best_final_a2c/best_model.zip",
-        "./models/best_final_a2c/vecnormalize.pkl",
-    ),
+    ModelSpec("PPO", "sb3", "./models/best_ppo/best_model.zip", "./models/vecnormalize_ppo.pkl", PPO),
+    ModelSpec("A2C Final", "sb3", "./models/best_final_a2c/best_model.zip", "./models/best_final_a2c/vecnormalize.pkl", A2C),
+    ModelSpec("PPO-LSTM Final", "recurrent", "./models/best_final_recurrent_ppo/best_model.zip", "./models/best_final_recurrent_ppo/vecnormalize.pkl"),
+    ModelSpec("Vanilla DQN freq1", "dqn", "./models/best_vanilla_dqn_freq1/best_model.zip", "./models/vecnormalize_vanilla_dqn_freq1.pkl"),
+    ModelSpec("Double DQN freq1", "dqn", "./models/best_double_dqn_freq1/best_model.zip", "./models/vecnormalize_double_dqn_freq1.pkl"),
+    ModelSpec("Dueling DQN freq1", "dqn", "./models/best_dueling_dqn_freq1/best_model.zip", "./models/vecnormalize_dueling_dqn_freq1.pkl", custom_policy=DuelingDQNPolicy),
+    ModelSpec("Double+Dueling DQN freq1", "dqn", "./models/best_double_dueling_dqn_freq1/best_model.zip", "./models/vecnormalize_double_dueling_dqn_freq1.pkl", custom_policy=DoubleDuelingDQNPolicy),
+    ModelSpec("Rule-Based Baseline", "baseline"),
 ]
 
 
-TRAFFIC_CASES = {
-    "deterministic": {
-        "traffic_mode": "deterministic",
-        "traffic_kwargs": {
-            "spike_probability": 0.0,
-        },
-    },
-    "poisson_only": {
-        "traffic_mode": "stochastic",
-        "traffic_kwargs": {
-            "spike_probability": 0.0,
-        },
-    },
-    "bursty_spikes": {
-        "traffic_mode": "stochastic",
-        "traffic_kwargs": {
-            "spike_probability": 0.05,
-            "spike_multiplier": 3.0,
-        },
-    },
-}
+TRAFFIC_CASES = [
+    TrafficSpec("deterministic", {"traffic_mode": "deterministic", "traffic_kwargs": {"spike_probability": 0.0}}),
+    TrafficSpec("poisson_only", {"traffic_mode": "stochastic", "traffic_kwargs": {"spike_probability": 0.0}}),
+    TrafficSpec("bursty_spikes", {"traffic_mode": "stochastic", "traffic_kwargs": {"spike_probability": 0.05, "spike_multiplier": 3.0}}),
+]
 
 
 def parse_seeds(seed_text):
     return [int(seed.strip()) for seed in seed_text.split(",") if seed.strip()]
 
 
-def make_eval_env(seed, vecnorm_path, env_kwargs):
+def make_eval_env(seed, vecnorm_path=None, env_kwargs=None):
+    env_kwargs = env_kwargs or {}
     env = DummyVecEnv([make_env(rank=0, seed=seed, **env_kwargs)])
 
-    if vecnorm_path and os.path.exists(vecnorm_path):
+    if vecnorm_path is not None:
         env = VecNormalize.load(vecnorm_path, env)
         env.training = False
         env.norm_reward = False
@@ -92,58 +78,61 @@ def make_eval_env(seed, vecnorm_path, env_kwargs):
     return env
 
 
+def load_dqn_model(spec):
+    if spec.custom_policy is None:
+        return DQN.load(spec.model_path)
+
+    return DQN.load(
+        spec.model_path,
+        custom_objects={"policy_class": spec.custom_policy},
+    )
+
+
 def load_adapter(spec):
+    if spec.model_type == "baseline":
+        baseline = RuleBasedBaseline()
+        return BaselineAdapter(spec.name, baseline), None
+
     if not os.path.exists(spec.model_path):
         print(f"[SKIP] {spec.name}: missing model {spec.model_path}")
-        return None
+        return None, None
 
     if not os.path.exists(spec.vecnorm_path):
         print(f"[SKIP] {spec.name}: missing VecNormalize {spec.vecnorm_path}")
-        return None
+        return None, None
+
+    if spec.model_type == "recurrent":
+        if RecurrentPPO is None:
+            print(f"[SKIP] {spec.name}: sb3-contrib is not installed.")
+            return None, None
+        model = RecurrentPPO.load(spec.model_path)
+        return RecurrentPPOAdapter(spec.name, model), spec.vecnorm_path
+
+    if spec.model_type == "dqn":
+        model = load_dqn_model(spec)
+        return SB3AgentAdapter(spec.name, model), spec.vecnorm_path
 
     model = spec.model_class.load(spec.model_path)
-    return SB3AgentAdapter(spec.name, model)
-
-
-def load_recurrent_ppo_adapter():
-    if RecurrentPPO is None:
-        print("[SKIP] PPO-LSTM: sb3-contrib is not installed.")
-        return None, None
-
-    model_path = "./models/best_final_recurrent_ppo/best_model.zip"
-    vecnorm_path = "./models/best_final_recurrent_ppo/vecnormalize.pkl"
-
-    if not os.path.exists(model_path):
-        print(f"[SKIP] PPO-LSTM: missing model {model_path}")
-        return None, None
-
-    if not os.path.exists(vecnorm_path):
-        print(f"[SKIP] PPO-LSTM: missing VecNormalize {vecnorm_path}")
-        return None, None
-
-    model = RecurrentPPO.load(model_path)
-    return RecurrentPPOAdapter("PPO-LSTM Final", model), vecnorm_path
+    return SB3AgentAdapter(spec.name, model), spec.vecnorm_path
 
 
 def run_episode(adapter, env, max_queue=500):
     obs = env.reset()
     done = np.array([False])
-
     adapter.reset_episode(num_envs=env.num_envs)
 
     total_return = 0.0
     total_cost = 0.0
     total_dropped = 0.0
     total_queue = 0.0
-
     previous_action = None
     action_switches = 0
     steps = 0
 
     while not done[0]:
         action = adapter.predict(obs, done)
-
         current_action = int(np.asarray(action).flatten()[0])
+
         if previous_action is not None and current_action != previous_action:
             action_switches += 1
         previous_action = current_action
@@ -151,10 +140,14 @@ def run_episode(adapter, env, max_queue=500):
         obs, reward, done, infos = env.step(action)
         info = infos[0]
 
+        active_servers = info.get("active", info.get("active_servers", 0.0))
+        dropped = info.get("dropped", info.get("dropped_requests", 0.0))
+        queue = info.get("queue", info.get("queue_length", 0.0))
+
         total_return += float(reward[0])
-        total_cost += float(info["active"])
-        total_dropped += float(info["dropped"])
-        total_queue += float(info["queue"])
+        total_cost += float(active_servers)
+        total_dropped += float(dropped)
+        total_queue += float(queue)
         steps += 1
 
     mean_queue = total_queue / max(1, steps)
@@ -184,13 +177,10 @@ def summarize(rows):
     ]
 
     summary = {}
-
     for metric in metrics:
         values = np.array([row[metric] for row in rows], dtype=float)
         summary[f"{metric}_mean"] = float(values.mean())
-        summary[f"{metric}_std"] = (
-            float(values.std(ddof=1)) if len(values) > 1 else 0.0
-        )
+        summary[f"{metric}_std"] = float(values.std(ddof=1)) if len(values) > 1 else 0.0
 
     return summary
 
@@ -202,7 +192,7 @@ def write_csv(path, rows):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=sorted(rows[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
 
@@ -215,113 +205,64 @@ def write_json(path, data):
 
 
 def plot_grouped_metric(summary_rows, metric, out_dir):
-    algorithms = [row["algorithm"] for row in summary_rows]
-    algorithms = list(dict.fromkeys(algorithms))
+    traffic_names = [case.name for case in TRAFFIC_CASES]
+    algorithms = sorted({row["algorithm"] for row in summary_rows})
+    x = np.arange(len(traffic_names))
+    width = 0.8 / max(1, len(algorithms))
 
-    traffic_cases = list(TRAFFIC_CASES.keys())
+    plt.figure(figsize=(16, 6))
 
-    lookup = {
-        (row["algorithm"], row["traffic_case"]): row
-        for row in summary_rows
-    }
-
-    x = np.arange(len(algorithms))
-    width = 0.25
-
-    plt.figure(figsize=(14, 6))
-
-    for i, traffic_case in enumerate(traffic_cases):
+    for i, algorithm in enumerate(algorithms):
         means = []
         stds = []
 
-        for algorithm in algorithms:
-            row = lookup.get((algorithm, traffic_case))
-            if row is None:
-                means.append(0.0)
-                stds.append(0.0)
-            else:
-                means.append(row[f"{metric}_mean"])
-                stds.append(row[f"{metric}_std"])
+        for traffic_name in traffic_names:
+            match = [
+                row for row in summary_rows
+                if row["algorithm"] == algorithm and row["traffic_case"] == traffic_name
+            ]
+            means.append(match[0][f"{metric}_mean"] if match else 0.0)
+            stds.append(match[0][f"{metric}_std"] if match else 0.0)
 
-        plt.bar(
-            x + (i - 1) * width,
-            means,
-            width,
-            yerr=stds,
-            capsize=3,
-            label=traffic_case,
-        )
+        offset = (i - (len(algorithms) - 1) / 2) * width
+        plt.bar(x + offset, means, width, yerr=stds, capsize=3, label=algorithm)
 
-    if metric == "return":
-        ylabel = "return"
-        note = "closer to zero is better"
-    elif metric == "latency_proxy":
-        ylabel = "latency proxy"
-        note = "lower is better"
-    elif metric in {"cost", "dropped_requests"}:
-        ylabel = metric.replace("_", " ")
-        note = "lower is better"
-    else:
-        ylabel = metric.replace("_", " ")
-        note = "higher is better"
-
-    plt.xticks(x, algorithms, rotation=30, ha="right")
-    plt.ylabel(ylabel)
-    plt.title(f"Traffic Stress Test: {ylabel} ({note})")
+    plt.xticks(x, traffic_names)
+    plt.ylabel(metric.replace("_", " "))
+    plt.title(f"Traffic Stress Test: {metric.replace('_', ' ')}")
     plt.grid(axis="y", alpha=0.3)
-    plt.legend()
+    plt.legend(fontsize=8, ncol=2)
     plt.tight_layout()
 
-    path = os.path.join(out_dir, f"{metric}.png")
-    plt.savefig(path, dpi=200)
+    plt.savefig(os.path.join(out_dir, f"{metric}.png"), dpi=200)
     plt.close()
 
 
 def plot_traffic_curve(summary_rows, metric, out_dir):
-    algorithms = list(dict.fromkeys(row["algorithm"] for row in summary_rows))
-    traffic_cases = list(TRAFFIC_CASES.keys())
+    traffic_names = [case.name for case in TRAFFIC_CASES]
+    algorithms = sorted({row["algorithm"] for row in summary_rows})
 
-    lookup = {
-        (row["algorithm"], row["traffic_case"]): row
-        for row in summary_rows
-    }
-
-    x = np.arange(len(traffic_cases))
-
-    plt.figure(figsize=(10, 5))
+    plt.figure(figsize=(12, 5))
 
     for algorithm in algorithms:
-        means = []
-        stds = []
+        values = []
 
-        for traffic_case in traffic_cases:
-            row = lookup.get((algorithm, traffic_case))
-            if row is None:
-                means.append(np.nan)
-                stds.append(0.0)
-            else:
-                means.append(row[f"{metric}_mean"])
-                stds.append(row[f"{metric}_std"])
+        for traffic_name in traffic_names:
+            match = [
+                row for row in summary_rows
+                if row["algorithm"] == algorithm and row["traffic_case"] == traffic_name
+            ]
+            values.append(match[0][f"{metric}_mean"] if match else np.nan)
 
-        plt.errorbar(
-            x,
-            means,
-            yerr=stds,
-            marker="o",
-            linewidth=2,
-            capsize=4,
-            label=algorithm,
-        )
+        plt.plot(traffic_names, values, marker="o", linewidth=2, label=algorithm)
 
-    plt.xticks(x, traffic_cases, rotation=20, ha="right")
     plt.ylabel(metric.replace("_", " "))
-    plt.title(f"Traffic degradation curve: {metric.replace('_', ' ')}")
+    plt.title(f"Traffic Stress Curve: {metric.replace('_', ' ')}")
     plt.grid(alpha=0.3)
-    plt.legend()
+    plt.legend(fontsize=8, ncol=2)
     plt.tight_layout()
 
-    path = os.path.join(out_dir, f"{metric}_traffic_curve.png")
-    plt.savefig(path, dpi=200)
+    plt.savefig(os.path.join(out_dir, f"{metric}_traffic_curve.png"), dpi=200)
     plt.close()
 
 
@@ -334,78 +275,66 @@ def plot_all_traffic_curves(summary_rows, out_dir):
         "action_stability",
     ]
 
-    algorithms = list(dict.fromkeys(row["algorithm"] for row in summary_rows))
-    traffic_cases = list(TRAFFIC_CASES.keys())
+    traffic_names = [case.name for case in TRAFFIC_CASES]
+    algorithms = sorted({row["algorithm"] for row in summary_rows})
 
-    lookup = {
-        (row["algorithm"], row["traffic_case"]): row
-        for row in summary_rows
-    }
-
-    x = np.arange(len(traffic_cases))
-
-    fig, axes = plt.subplots(2, 3, figsize=(17, 9))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 9))
     axes = axes.flatten()
 
     for ax, metric in zip(axes, metrics):
         for algorithm in algorithms:
-            means = []
-            stds = []
+            values = []
 
-            for traffic_case in traffic_cases:
-                row = lookup.get((algorithm, traffic_case))
-                if row is None:
-                    means.append(np.nan)
-                    stds.append(0.0)
-                else:
-                    means.append(row[f"{metric}_mean"])
-                    stds.append(row[f"{metric}_std"])
+            for traffic_name in traffic_names:
+                match = [
+                    row for row in summary_rows
+                    if row["algorithm"] == algorithm and row["traffic_case"] == traffic_name
+                ]
+                values.append(match[0][f"{metric}_mean"] if match else np.nan)
 
-            ax.errorbar(
-                x,
-                means,
-                yerr=stds,
-                marker="o",
-                linewidth=2,
-                capsize=3,
-                label=algorithm,
-            )
+            ax.plot(traffic_names, values, marker="o", linewidth=2, label=algorithm)
 
         ax.set_title(metric.replace("_", " "))
-        ax.set_xticks(x)
-        ax.set_xticklabels(traffic_cases, rotation=20, ha="right")
         ax.grid(alpha=0.3)
+        ax.tick_params(axis="x", rotation=15)
 
     axes[-1].axis("off")
-    axes[0].legend(loc="best")
-    fig.suptitle("Traffic Stress Test Curves", fontsize=14)
-    fig.tight_layout()
 
-    path = os.path.join(out_dir, "all_traffic_curves.png")
-    fig.savefig(path, dpi=200)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=4, fontsize=8)
+    fig.suptitle("Traffic Stress Test Summary", fontsize=14)
+    fig.tight_layout(rect=(0, 0.08, 1, 0.95))
+
+    fig.savefig(os.path.join(out_dir, "all_traffic_curves.png"), dpi=200)
     plt.close(fig)
 
 
 def print_summary(summary_rows):
     print("\n=== Traffic Stress Test Summary ===")
 
-    for row in summary_rows:
-        print(f"\n{row['algorithm']} | {row['traffic_case']}")
-        print(f"  Return:           {row['return_mean']:.2f} +/- {row['return_std']:.2f}")
-        print(f"  Latency proxy:    {row['latency_proxy_mean']:.4f} +/- {row['latency_proxy_std']:.4f}")
-        print(f"  Cost:             {row['cost_mean']:.2f} +/- {row['cost_std']:.2f}")
-        print(f"  Dropped requests: {row['dropped_requests_mean']:.2f} +/- {row['dropped_requests_std']:.2f}")
-        print(f"  Action stability: {row['action_stability_mean']:.4f} +/- {row['action_stability_std']:.4f}")
+    for traffic_case in [case.name for case in TRAFFIC_CASES]:
+        print(f"\nTraffic case: {traffic_case}")
+
+        rows = [row for row in summary_rows if row["traffic_case"] == traffic_case]
+        for row in rows:
+            print(f"  {row['algorithm']}")
+            print(f"    Return: {row['return_mean']:.2f} +/- {row['return_std']:.2f}")
+            print(f"    Latency proxy: {row['latency_proxy_mean']:.4f} +/- {row['latency_proxy_std']:.4f}")
+            print(f"    Cost: {row['cost_mean']:.2f} +/- {row['cost_std']:.2f}")
+            print(f"    Dropped requests: {row['dropped_requests_mean']:.2f} +/- {row['dropped_requests_std']:.2f}")
+            print(f"    Action stability: {row['action_stability_mean']:.4f} +/- {row['action_stability_std']:.4f}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Traffic stress test with adapters")
+    parser = argparse.ArgumentParser(
+        description="Evaluate final models under deterministic, Poisson, and bursty traffic."
+    )
 
     parser.add_argument(
         "--seeds",
         type=str,
         default="0,1,2,3,4",
-        help="Comma-separated evaluation traffic seeds.",
+        help="Comma-separated evaluation seeds.",
     )
 
     parser.add_argument(
@@ -419,51 +348,52 @@ def main():
     seeds = parse_seeds(args.seeds)
 
     adapters_with_vecnorm = []
-
     for spec in MODEL_SPECS:
-        adapter = load_adapter(spec)
+        adapter, vecnorm_path = load_adapter(spec)
         if adapter is not None:
-            adapters_with_vecnorm.append((adapter, spec.vecnorm_path))
+            adapters_with_vecnorm.append((adapter, vecnorm_path))
 
-    recurrent_adapter, recurrent_vecnorm = load_recurrent_ppo_adapter()
-    if recurrent_adapter is not None:
-        adapters_with_vecnorm.append((recurrent_adapter, recurrent_vecnorm))
+    if not adapters_with_vecnorm:
+        raise RuntimeError("No models were loaded. Check model paths.")
 
     all_episode_rows = []
     summary_rows = []
 
-    for adapter, vecnorm_path in adapters_with_vecnorm:
-        for traffic_case, env_kwargs in TRAFFIC_CASES.items():
-            print(f"\nEvaluating {adapter.name} on {traffic_case} traffic...")
+    for traffic_case in TRAFFIC_CASES:
+        print(f"\n=== Evaluating traffic case: {traffic_case.name} ===")
 
-            case_rows = []
+        for adapter, vecnorm_path in adapters_with_vecnorm:
+            print(f"Evaluating {adapter.name}...")
+
+            rows_for_group = []
 
             for seed in seeds:
                 env = make_eval_env(
                     seed=seed,
                     vecnorm_path=vecnorm_path,
-                    env_kwargs=env_kwargs,
+                    env_kwargs=traffic_case.env_kwargs,
                 )
 
                 metrics = run_episode(adapter, env)
                 env.close()
 
                 row = {
+                    "traffic_case": traffic_case.name,
                     "algorithm": adapter.name,
-                    "traffic_case": traffic_case,
                     "seed": seed,
                     **metrics,
                 }
 
                 all_episode_rows.append(row)
-                case_rows.append(row)
+                rows_for_group.append(row)
 
-            summary = summarize(case_rows)
-            summary["algorithm"] = adapter.name
-            summary["traffic_case"] = traffic_case
-            summary["num_seeds"] = len(seeds)
-
-            summary_rows.append(summary)
+            summary = summarize(rows_for_group)
+            summary_rows.append({
+                "traffic_case": traffic_case.name,
+                "algorithm": adapter.name,
+                "num_seeds": len(seeds),
+                **summary,
+            })
 
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -484,7 +414,7 @@ def main():
     plot_all_traffic_curves(summary_rows, args.out_dir)
 
     print_summary(summary_rows)
-    print(f"\nSaved traffic stress-test results to: {args.out_dir}")
+    print(f"\nSaved results to: {args.out_dir}")
 
 
 if __name__ == "__main__":

@@ -1,52 +1,35 @@
-"""
-Adapter classes for comparing different agents with one evaluation loop.
-
-we use adapters case not all agents are called in the same way.
-
-Normal SB3 models such as PPO, A2C, and DQN use:
-    model.predict(obs, deterministic=True)
-
-PPO-LSTM is different because it needs memory:
-    model.predict(obs, state=lstm_state, episode_start=episode_start)
-
-The rule-based baseline is also different because it is not a trained SB3 model.
-
-The adapter pattern hides these differences. The evaluator only calls:
-    adapter.reset_episode()
-    adapter.predict(obs, done)
-
-So our main comparison code stays clean.
-"""
+"""Adapters for evaluating different policy APIs with one loop."""
 
 import numpy as np
 
 
 class AgentAdapter:
+    """Base adapter interface used by evaluation scripts."""
+
     def __init__(self, name):
         self.name = name
 
     def reset_episode(self, num_envs=1):
         pass
 
-    def predict(self, obs, done):
+    def predict(self, obs, done=None):
         raise NotImplementedError
 
 
 class SB3AgentAdapter(AgentAdapter):
-    """Adapter for normal SB3 models: PPO, A2C, DQN variants, and Sparse PPO."""
+    """Adapter for normal SB3 models: PPO, A2C, and DQN variants."""
 
     def __init__(self, name, model):
         super().__init__(name)
         self.model = model
 
-    def predict(self, obs, done):
+    def predict(self, obs, done=None):
         action, _ = self.model.predict(obs, deterministic=True)
         return action
 
 
 class RecurrentPPOAdapter(AgentAdapter):
-    """this is adapter for PPO-LSTM. PPO-LSTM needs to keep its LSTM state during the episode.
-    """
+    """Adapter for PPO-LSTM / RecurrentPPO."""
 
     def __init__(self, name, model):
         super().__init__(name)
@@ -58,7 +41,7 @@ class RecurrentPPOAdapter(AgentAdapter):
         self.lstm_state = None
         self.episode_start = np.ones((num_envs,), dtype=bool)
 
-    def predict(self, obs, done):
+    def predict(self, obs, done=None):
         action, self.lstm_state = self.model.predict(
             obs,
             state=self.lstm_state,
@@ -70,12 +53,12 @@ class RecurrentPPOAdapter(AgentAdapter):
 
 
 class BaselineAdapter(AgentAdapter):
-    """Adapter for the rule-based baseline."""
+    """Adapter for RuleBasedBaseline from baseline_agent.py."""
 
-    def __init__(self, model):
-        super().__init__("Rule-Based Baseline")
+    def __init__(self, name, model):
+        super().__init__(name)
         self.model = model
 
-    def predict(self, obs, done):
+    def predict(self, obs, done=None):
         action, _ = self.model.predict(obs, deterministic=True)
         return action
